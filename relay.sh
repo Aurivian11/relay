@@ -11,7 +11,7 @@
 # =============================================================
 set -o pipefail
 
-RELAY_VER="1.0.0"
+RELAY_VER="1.1.0"
 SCRIPT_URL="${RELAY_URL:-https://raw.githubusercontent.com/Aurivian11/relay/main/relay.sh}"
 
 BASE=/etc/relay
@@ -236,7 +236,7 @@ ask_ss() {   # ask_ss "落地"|"跳板" 前缀(LAND|HOP)：粘贴链接或手动
       P_HOST=$(ask "$what 地址（IP 或域名）" ""); P_HOST=${P_HOST#[}; P_HOST=${P_HOST%]}
       P_PORT=$(ask "$what 端口" "")
       echo "加密方式："
-      local i=1 m arr=(aes-256-gcm aes-128-gcm chacha20-ietf-poly1305 2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm 2022-blake3-chacha20-poly1305)
+      local i=1 m arr=(2022-blake3-aes-128-gcm aes-256-gcm aes-128-gcm chacha20-ietf-poly1305 2022-blake3-aes-256-gcm 2022-blake3-chacha20-poly1305)
       for m in "${arr[@]}"; do echo "  $i) $m"; i=$((i+1)); done
       c=$(ask "请选择" 1); [[ $c =~ ^[1-6]$ ]] || c=1; P_METHOD=${arr[$((c-1))]}
       P_PASS=$(ask "$what 密码" "")
@@ -256,21 +256,65 @@ hp() { [[ $1 == *:* ]] && echo "[$1]:$2" || echo "$1:$2"; }   # 地址:端口（
 reach() { timeout 5 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
 
 # ---------------- 线路 ----------------
-# 线路文件 $LINES/ID.env：NAME IN_TYPE IN_PORT (REALITY: UUID SNI PRIV PUB SID | SS: IN_METHOD IN_PASS)
-#                        LAND_HOST LAND_PORT LAND_METHOD LAND_PASS  [HOP_HOST HOP_PORT HOP_METHOD HOP_PASS]
+# 线路文件 $LINES/ID.env：
+#   NAME IN_TYPE IN_PORT  (REALITY: UUID SNI PRIV PUB SID | SS: IN_METHOD IN_PASS)
+#   LN=落地个数；第 k 个落地：Lk_HOST Lk_PORT Lk_METHOD Lk_PASS  [Lk_HOP_HOST Lk_HOP_PORT Lk_HOP_METHOD Lk_HOP_PASS]
+#   多个落地时自动选延迟最低的可用落地，挂了自动切换
+# 1.0 版的线路（LAND_* / HOP_*）读取时自动当成 1 个落地
 line_ids() { ls "$LINES"/*.env 2>/dev/null | sed 's#.*/##; s#\.env$##' | sort -n; }
 next_id() { local m; m=$(line_ids | tail -1); echo $(( ${m:-0} + 1 )); }
 save_line() {   # save_line ID KEY=VAL ...
   local f=$LINES/$1.env; shift
-  mkdir -p "$LINES"; : >"$f"; chmod 600 "$f"
-  local kv; for kv in "$@"; do printf "%s=%q\n" "${kv%%=*}" "${kv#*=}" >>"$f"; done
+  mkdir -p "$LINES"; : >"$f.tmp"; chmod 600 "$f.tmp"
+  local kv; for kv in "$@"; do printf "%s=%q\n" "${kv%%=*}" "${kv#*=}" >>"$f.tmp"; done
+  mv -f "$f.tmp" "$f"
 }
-load_line() { NAME=""; IN_TYPE=""; HOP_HOST=""; HOP_PORT=""; HOP_METHOD=""; HOP_PASS=""; . "$LINES/$1.env"; }
+gv() { echo "${!1}"; }
+load_line() {   # -> NAME IN_* LN 和数组 LH LP LM LW（落地）HH HP HM HW（跳板，可为空）
+  NAME=""; IN_TYPE=""; IN_PORT=""; UUID=""; SNI=""; PRIV=""; PUB=""; SID=""; IN_METHOD=""; IN_PASS=""
+  LN=0; LAND_HOST=""; LAND_PORT=""; LAND_METHOD=""; LAND_PASS=""; HOP_HOST=""; HOP_PORT=""; HOP_METHOD=""; HOP_PASS=""
+  LH=(); LP=(); LM=(); LW=(); HH=(); HP=(); HM=(); HW=()
+  . "$LINES/$1.env"
+  if [[ $LN == 0 && -n $LAND_HOST ]]; then   # 1.0 格式
+    LN=1; LH[1]=$LAND_HOST; LP[1]=$LAND_PORT; LM[1]=$LAND_METHOD; LW[1]=$LAND_PASS
+    HH[1]=$HOP_HOST; HP[1]=$HOP_PORT; HM[1]=$HOP_METHOD; HW[1]=$HOP_PASS
+    return
+  fi
+  local k
+  for ((k = 1; k <= LN; k++)); do
+    LH[k]=$(gv "L${k}_HOST"); LP[k]=$(gv "L${k}_PORT"); LM[k]=$(gv "L${k}_METHOD"); LW[k]=$(gv "L${k}_PASS")
+    HH[k]=$(gv "L${k}_HOP_HOST"); HP[k]=$(gv "L${k}_HOP_PORT"); HM[k]=$(gv "L${k}_HOP_METHOD"); HW[k]=$(gv "L${k}_HOP_PASS")
+    unset "L${k}_HOST" "L${k}_PORT" "L${k}_METHOD" "L${k}_PASS" "L${k}_HOP_HOST" "L${k}_HOP_PORT" "L${k}_HOP_METHOD" "L${k}_HOP_PASS"
+  done
+}
+line_kv() {   # 当前变量 -> save_line 参数（NUL 分隔）
+  local a=(NAME="$NAME" IN_TYPE="$IN_TYPE" IN_PORT="$IN_PORT") k
+  if [[ $IN_TYPE == reality ]]; then a+=(UUID="$UUID" SNI="$SNI" PRIV="$PRIV" PUB="$PUB" SID="$SID")
+  else a+=(IN_METHOD="$IN_METHOD" IN_PASS="$IN_PASS"); fi
+  a+=(LN="$LN")
+  for ((k = 1; k <= LN; k++)); do
+    a+=("L${k}_HOST=${LH[k]}" "L${k}_PORT=${LP[k]}" "L${k}_METHOD=${LM[k]}" "L${k}_PASS=${LW[k]}"
+        "L${k}_HOP_HOST=${HH[k]}" "L${k}_HOP_PORT=${HP[k]}" "L${k}_HOP_METHOD=${HM[k]}" "L${k}_HOP_PASS=${HW[k]}")
+  done
+  printf '%s\0' "${a[@]}"
+}
+store_line() { local kv; mapfile -d '' kv < <(line_kv); save_line "$1" "${kv[@]}"; }
 
 ss_out() {   # ss_out tag host port method pass [dialerProxy]
   jq -nc --arg t "$1" --arg h "$2" --argjson p "$3" --arg m "$4" --arg pw "$5" --arg dp "${6:-}" \
     '{tag:$t,protocol:"shadowsocks",settings:{servers:[{address:$h,port:$p,method:$m,password:$pw}]}}
      + (if $dp == "" then {} else {streamSettings:{sockopt:{dialerProxy:$dp}}} end)'
+}
+land_outs() {   # land_outs 前缀：当前线路全部落地（和跳板）的出站，tag = 前缀k / 前缀k-hop
+  local k
+  for ((k = 1; k <= LN; k++)); do
+    if [[ -n ${HH[k]} ]]; then
+      ss_out "$1$k-hop" "${HH[k]}" "${HP[k]}" "${HM[k]}" "${HW[k]}"
+      ss_out "$1$k" "${LH[k]}" "${LP[k]}" "${LM[k]}" "${LW[k]}" "$1$k-hop"
+    else
+      ss_out "$1$k" "${LH[k]}" "${LP[k]}" "${LM[k]}" "${LW[k]}"
+    fi
+  done
 }
 in_json() {   # 当前已 load_line 的入口
   case $IN_TYPE in
@@ -284,29 +328,34 @@ in_json() {   # 当前已 load_line 的入口
   esac
 }
 listen_fix() { [[ -f /proc/net/if_inet6 ]] && cat || sed 's/"listen":"::"/"listen":"0.0.0.0"/g'; }
+jarr() { if [[ $# -eq 0 ]]; then echo '[]'; else printf '%s\n' "$@" | jq -s .; fi; }
 
 apply() {   # 按全部线路生成 Xray 配置并重启
-  local ins=() outs=() rules=() ID
+  local ins=() outs=() rules=() bals=() subj=() ID o
   for ID in $(line_ids); do
     load_line "$ID"
     ins+=("$(in_json)")
-    if [[ -n $HOP_HOST ]]; then
-      outs+=("$(ss_out "hop-$ID" "$HOP_HOST" "$HOP_PORT" "$HOP_METHOD" "$HOP_PASS")")
-      outs+=("$(ss_out "land-$ID" "$LAND_HOST" "$LAND_PORT" "$LAND_METHOD" "$LAND_PASS" "hop-$ID")")
+    while IFS= read -r o; do outs+=("$o"); done < <(land_outs "land-$ID-")
+    if (( LN > 1 )); then   # 多个落地：observatory 测延迟，leastPing 自动选最快的可用落地
+      bals+=("$(jq -nc --arg t "bal-$ID" --arg s "land-$ID-" --arg f "land-$ID-1" \
+        '{tag:$t,selector:[$s],strategy:{type:"leastPing"},fallbackTag:$f}')")
+      subj+=("\"land-$ID-\"")   # jarr 要的是 JSON，字符串要带引号
+      rules+=("$(jq -nc --arg i "in-$ID" --arg b "bal-$ID" '{type:"field",inboundTag:[$i],balancerTag:$b}')")
     else
-      outs+=("$(ss_out "land-$ID" "$LAND_HOST" "$LAND_PORT" "$LAND_METHOD" "$LAND_PASS")")
+      rules+=("$(jq -nc --arg i "in-$ID" --arg o "land-$ID-1" '{type:"field",inboundTag:[$i],outboundTag:$o}')")
     fi
-    rules+=("$(jq -nc --arg i "in-$ID" --arg o "land-$ID" '{type:"field",inboundTag:[$i],outboundTag:$o}')")
   done
-  if [[ ${#ins[@]} -eq 0 ]]; then svc stop; rm -f "$CONF"; return 0; fi
+  if [[ ${#ins[@]} -eq 0 ]]; then svc stop; rm -f "$CONF"; gen_sub; return 0; fi
   install_xray || return 1
   local td; td=$(mktemp -d)
-  jq -n --argjson i "$(printf '%s\n' "${ins[@]}" | jq -s .)" --argjson o "$(printf '%s\n' "${outs[@]}" | jq -s .)" \
-        --argjson r "$(printf '%s\n' "${rules[@]}" | jq -s .)" \
+  jq -n --argjson i "$(jarr "${ins[@]}")" --argjson o "$(jarr "${outs[@]}")" --argjson r "$(jarr "${rules[@]}")" \
+        --argjson b "$(jarr "${bals[@]}")" --argjson s "$(jarr "${subj[@]}")" \
     '{log:{loglevel:"warning"},inbounds:$i,
       outbounds:([{protocol:"blackhole",tag:"block"}] + $o),
-      routing:{domainStrategy:"AsIs",rules:([{type:"field",outboundTag:"block",
-        ip:["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","127.0.0.0/8","169.254.0.0/16","100.64.0.0/10","fc00::/7","fe80::/10","::1/128"]}] + $r)}}' \
+      routing:{domainStrategy:"AsIs",balancers:$b,rules:([{type:"field",outboundTag:"block",
+        ip:["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","127.0.0.0/8","169.254.0.0/16","100.64.0.0/10","fc00::/7","fe80::/10","::1/128"]}] + $r)}}
+     + (if ($s|length) == 0 then {} else
+         {observatory:{subjectSelector:$s,probeUrl:"https://www.gstatic.com/generate_204",probeInterval:"30s",enableConcurrency:true}} end)' \
     | listen_fix >"$td/xray.json"
   if ! "$BIN" run -test -c "$td/xray.json" >"$td/err" 2>&1; then
     red "Xray 配置检查失败："; tail -5 "$td/err"; rm -rf "$td"; return 1
@@ -314,6 +363,7 @@ apply() {   # 按全部线路生成 Xray 配置并重启
   install -m 600 "$td/xray.json" "$CONF"; rm -rf "$td"
   svc restart; sleep 1
   [[ $(svc status) == active ]] || { red "Xray 启动失败，查看日志：journalctl -u $SVC -n 30"; return 1; }
+  gen_sub
 }
 
 # ---------------- 输出 ----------------
@@ -332,9 +382,15 @@ clash_line() {   # clash_line 主机
     ss) echo "  - {name: \"$n\", type: ss, server: \"$h\", port: $IN_PORT, cipher: $IN_METHOD, password: \"$IN_PASS\", udp: true}" ;;
   esac
 }
+land_text() {   # land_text k
+  local k=$1
+  if [[ -n ${HH[k]} ]]; then echo "跳板 $(hp "${HH[k]}" "${HP[k]}") → 落地 $(hp "${LH[k]}" "${LP[k]}")"
+  else echo "落地 $(hp "${LH[k]}" "${LP[k]}")"; fi
+}
 route_text() {   # 已 load_line
-  if [[ -n $HOP_HOST ]]; then echo "我 → 本机:$IN_PORT → 跳板 $(hp "$HOP_HOST" "$HOP_PORT") → 落地 $(hp "$LAND_HOST" "$LAND_PORT")"
-  else echo "我 → 本机:$IN_PORT → 落地 $(hp "$LAND_HOST" "$LAND_PORT")"; fi
+  if (( LN <= 1 )); then echo "我 → 本机:$IN_PORT → $(land_text 1)"; return; fi
+  echo "我 → 本机:$IN_PORT → $LN 个落地自动切换（选延迟最低的可用落地）："
+  local k; for ((k = 1; k <= LN; k++)); do echo "      $k) $(land_text "$k")"; done
 }
 in_label() { [[ $IN_TYPE == reality ]] && echo "VLESS-REALITY" || echo "Shadowsocks ($IN_METHOD)"; }
 show_line() {   # show_line ID
@@ -354,9 +410,10 @@ list_lines() {
   local ids; ids=$(line_ids)
   [[ -n $ids ]] || { yellow "还没有线路，主菜单 1 添加"; return 1; }
   local ID; for ID in $ids; do show_line "$ID"; done
+  sub_on && { echo; import_info; }
   echo
 }
-brief() {   # 一行一条的简表
+brief() {   # 简表
   local ID; for ID in $(line_ids); do load_line "$ID"; echo "  [$ID] $NAME   $(in_label)   $(route_text)"; done
 }
 pick_line() {   # -> PICKED
@@ -366,15 +423,35 @@ pick_line() {   # -> PICKED
   [[ -f $LINES/$c.env ]] || { red "没有这条线路"; return 1; }
   PICKED=$c
 }
+pick_land() {   # 已 load_line -> PK（只有 1 个落地时直接选它）
+  if (( LN == 1 )); then PK=1; return 0; fi
+  local k; for ((k = 1; k <= LN; k++)); do echo "  $k) $(land_text "$k")"; done
+  read -r -p "选哪个落地: " PK || return 1
+  [[ $PK =~ ^[0-9]+$ ]] && (( PK >= 1 && PK <= LN )) || { red "没有这个落地"; return 1; }
+}
 
 # ---------------- 测试 ----------------
-test_lines() {   # test_lines [ID...]：在本机用 Xray 客户端连自己的入口，看出口是不是落地
+curl_t() {   # curl_t socks端口 -> "状态码 秒 出口IP"
+  # Xray 刚重启后第一次连接要多等几秒，第一次不通就再试一次，免得误报
+  local r ip n
+  for n in 1 2; do
+    r=$(curl -s --max-time 15 -x "socks5h://127.0.0.1:$1" -o /dev/null -w "%{http_code} %{time_total}" https://www.google.com/generate_204)
+    [[ ${r%% *} == 204 ]] && break
+  done
+  ip=$(curl -s --max-time 15 -x "socks5h://127.0.0.1:$1" https://api64.ipify.org)
+  echo "$r ${ip:--}"
+}
+ms() { awk -v t="$1" 'BEGIN{printf "%.0f", t*1000}'; }
+test_lines() {   # test_lines [ID...]：①从入口走一遍完整线路 ②每个落地单独直连测试
   local ids=("$@"); [[ ${#ids[@]} -eq 0 ]] && mapfile -t ids < <(line_ids)
   [[ ${#ids[@]} -gt 0 ]] || { yellow "还没有线路"; return 1; }
   [[ -f $CONF && $(svc status) == active ]] || { red "中转服务没有运行"; return 1; }
-  local td ins=() outs=() rules=() ID port i=0; td=$(mktemp -d)
+  local td ins=() outs=() rules=() ID k o port=15100; td=$(mktemp -d)
+  declare -A EP LPORT
   for ID in "${ids[@]}"; do
-    load_line "$ID"; port=$((15100 + i)); i=$((i+1))
+    [[ -f $LINES/$ID.env ]] || { red "没有线路 $ID"; continue; }
+    load_line "$ID"
+    EP[$ID]=$port
     ins+=("$(jq -nc --arg t "t$ID" --argjson p $port '{tag:$t,listen:"127.0.0.1",port:$p,protocol:"socks",settings:{udp:true}}')")
     case $IN_TYPE in
       reality) outs+=("$(jq -nc --arg t "o$ID" --argjson p "$IN_PORT" --arg u "$UUID" --arg sni "$SNI" --arg pbk "$PUB" --arg sid "$SID" \
@@ -383,30 +460,45 @@ test_lines() {   # test_lines [ID...]：在本机用 Xray 客户端连自己的�
       ss) outs+=("$(ss_out "o$ID" 127.0.0.1 "$IN_PORT" "$IN_METHOD" "$IN_PASS")") ;;
     esac
     rules+=("$(jq -nc --arg i "t$ID" --arg o "o$ID" '{type:"field",inboundTag:[$i],outboundTag:$o}')")
+    port=$((port + 1))
+    # 每个落地（含跳板）单独一个出口，不经过中转入口，用来判断是落地的问题还是中转的问题
+    while IFS= read -r o; do outs+=("$o"); done < <(land_outs "d$ID-")
+    for ((k = 1; k <= LN; k++)); do
+      LPORT[$ID-$k]=$port
+      ins+=("$(jq -nc --arg t "t$ID-$k" --argjson p $port '{tag:$t,listen:"127.0.0.1",port:$p,protocol:"socks",settings:{udp:true}}')")
+      rules+=("$(jq -nc --arg i "t$ID-$k" --arg o "d$ID-$k" '{type:"field",inboundTag:[$i],outboundTag:$o}')")
+      port=$((port + 1))
+    done
   done
-  jq -n --argjson i "$(printf '%s\n' "${ins[@]}" | jq -s .)" --argjson o "$(printf '%s\n' "${outs[@]}" | jq -s .)" \
-        --argjson r "$(printf '%s\n' "${rules[@]}" | jq -s .)" \
+  jq -n --argjson i "$(jarr "${ins[@]}")" --argjson o "$(jarr "${outs[@]}")" --argjson r "$(jarr "${rules[@]}")" \
     '{log:{loglevel:"error"},inbounds:$i,outbounds:$o,routing:{rules:$r}}' >"$td/c.json"
   "$BIN" run -c "$td/c.json" >"$td/log" 2>&1 & local pid=$!
   sleep 2
   echo
-  i=0; local ok=0
+  local ok=0 total=0 r
   for ID in "${ids[@]}"; do
-    load_line "$ID"; port=$((15100 + i)); i=$((i+1))
-    local r ip
-    r=$(curl -s --max-time 15 -x "socks5h://127.0.0.1:$port" -o /dev/null -w "%{http_code} %{time_total}" https://www.google.com/generate_204)
-    ip=$(curl -s --max-time 15 -x "socks5h://127.0.0.1:$port" https://api64.ipify.org)
-    if [[ ${r%% *} == 204 ]]; then
-      ok=$((ok+1)); printf '  ✅ [%s] %-14s %5.0f ms  出口 IP %s\n' "$ID" "$NAME" "$(awk -v t="${r##* }" 'BEGIN{print t*1000}')" "$ip"
+    [[ -n ${EP[$ID]} ]] || continue
+    load_line "$ID"; total=$((total + 1))
+    read -r -a r <<<"$(curl_t "${EP[$ID]}")"
+    if [[ ${r[0]} == 204 ]]; then
+      ok=$((ok + 1)); printf '  ✅ [%s] %-14s 整条线路通  %5s ms  出口 IP %s\n' "$ID" "$NAME" "$(ms "${r[1]}")" "${r[2]}"
     else
-      printf '  ❌ [%s] %-14s 不通\n' "$ID" "$NAME"
-      reach "$LAND_HOST" "$LAND_PORT" || echo "       本机 TCP 连不上落地 $(hp "$LAND_HOST" "$LAND_PORT")"
-      [[ -n $HOP_HOST ]] && { reach "$HOP_HOST" "$HOP_PORT" || echo "       本机 TCP 连不上跳板 $(hp "$HOP_HOST" "$HOP_PORT")"; }
-      echo "       也可能是落地$([[ -n $HOP_HOST ]] && echo " / 跳板")的加密方式或密码填错了"
+      printf '  ❌ [%s] %-14s 整条线路不通\n' "$ID" "$NAME"
     fi
+    for ((k = 1; k <= LN; k++)); do
+      read -r -a r <<<"$(curl_t "${LPORT[$ID-$k]}")"
+      if [[ ${r[0]} == 204 ]]; then
+        printf '       %s%s  ✅ %s ms  出口 %s\n' "$( ((LN > 1)) && echo "落地$k：")" "$(land_text "$k")" "$(ms "${r[1]}")" "${r[2]}"
+      else
+        printf '       %s%s  ❌ 不通' "$( ((LN > 1)) && echo "落地$k：")" "$(land_text "$k")"
+        if [[ -n ${HH[k]} ]] && ! reach "${HH[k]}" "${HP[k]}"; then echo "（本机 TCP 连不上跳板）"
+        elif [[ -z ${HH[k]} ]] && ! reach "${LH[k]}" "${LP[k]}"; then echo "（本机 TCP 连不上落地）"
+        else echo "（端口能连上，多半是加密方式或密码不对）"; fi
+      fi
+    done
   done
   kill $pid 2>/dev/null; rm -rf "$td"
-  echo "通过 $ok / ${#ids[@]}（出口 IP 应该是落地机的 IP）"
+  echo "整条线路通过 $ok / $total（出口 IP 应该是落地机的 IP；多个落地时会自动避开不通的那个）"
 }
 
 # ---------------- 添加 / 修改 / 删除 ----------------
@@ -427,10 +519,10 @@ ask_entry() {   # 入口协议、端口 -> IN_*（REALITY 还有 UUID SNI PRIV P
     break
   done
   if [[ $IN_TYPE == reality ]]; then
-    SNI=$(ask "伪装域名 (SNI)" "${SNI:-$DEF_SNI}")
+    SNI=$(ask "伪装域名 (SNI)" "${SNI_SET:-$DEF_SNI}")
     local kp; kp=$(gen_x25519); PRIV=${kp%% *}; PUB=${kp##* }; UUID=$(gen_uuid); SID=$(openssl rand -hex 8)
   else
-    if [[ $NONINT == 1 ]]; then IN_METHOD=${IN_METHOD:-2022-blake3-aes-128-gcm}
+    if [[ $NONINT == 1 ]]; then IN_METHOD=${IN_METHOD_SET:-2022-blake3-aes-128-gcm}
     else
       echo "入口加密方式："
       echo "  1) 2022-blake3-aes-128-gcm（默认）"
@@ -441,63 +533,86 @@ ask_entry() {   # 入口协议、端口 -> IN_*（REALITY 还有 UUID SNI PRIV P
     if [[ $IN_METHOD == 2022-* ]]; then IN_PASS=$(openssl rand -base64 16); else IN_PASS=$(rand_pw 24); fi
   fi
 }
-line_kv() {   # 当前变量 -> save_line 参数
-  local a=(NAME="$NAME" IN_TYPE="$IN_TYPE" IN_PORT="$IN_PORT")
-  if [[ $IN_TYPE == reality ]]; then a+=(UUID="$UUID" SNI="$SNI" PRIV="$PRIV" PUB="$PUB" SID="$SID")
-  else a+=(IN_METHOD="$IN_METHOD" IN_PASS="$IN_PASS"); fi
-  a+=(LAND_HOST="$LAND_HOST" LAND_PORT="$LAND_PORT" LAND_METHOD="$LAND_METHOD" LAND_PASS="$LAND_PASS")
-  [[ -n $HOP_HOST ]] && a+=(HOP_HOST="$HOP_HOST" HOP_PORT="$HOP_PORT" HOP_METHOD="$HOP_METHOD" HOP_PASS="$HOP_PASS")
-  printf '%s\0' "${a[@]}"
+ask_landing() {   # ask_landing k 标题：交互填第 k 个落地（可带跳板）
+  local k=$1 a
+  ask_ss "$2" LAND || return 1
+  LH[k]=$LAND_HOST; LP[k]=$LAND_PORT; LM[k]=$LAND_METHOD; LW[k]=$LAND_PASS; LTAG=$P_TAG
+  HH[k]=""; HP[k]=""; HM[k]=""; HW[k]=""
+  read -r -p "这个落地要经过跳板吗？（我 → 本机 → 跳板 → 落地）[y/N]: " a || a=n
+  if [[ $a == [yY] ]]; then
+    ask_ss "跳板" HOP || return 1
+    HH[k]=$HOP_HOST; HP[k]=$HOP_PORT; HM[k]=$HOP_METHOD; HW[k]=$HOP_PASS
+  fi
 }
 add_line() {
-  local ID; ID=$(next_id)
-  HOP_HOST=""; HOP_PORT=""; HOP_METHOD=""; HOP_PASS=""
-  if [[ $NONINT == 1 ]]; then   # 非交互：LAND=ss://... [HOP=ss://...] [IN=reality|ss] [PORT=] [NAME=]
-    [[ -n ${LAND:-} ]] || die "需要 LAND=落地的 ss:// 链接"
-    parse_ss "$LAND" || die "落地链接无效"
-    LAND_HOST=$P_HOST; LAND_PORT=$P_PORT; LAND_METHOD=$P_METHOD; LAND_PASS=$P_PASS; local tag=$P_TAG
-    if [[ -n ${HOP:-} ]]; then parse_ss "$HOP" || die "跳板链接无效"; HOP_HOST=$P_HOST; HOP_PORT=$P_PORT; HOP_METHOD=$P_METHOD; HOP_PASS=$P_PASS; fi
-    NAME=${NAME:-${tag:-落地$ID}}
+  local ID tag="" a l; ID=$(next_id)
+  LN=0; LH=(); LP=(); LM=(); LW=(); HH=(); HP=(); HM=(); HW=()
+  if [[ $NONINT == 1 ]]; then   # 非交互：LAND='ss://落地1 ss://落地2' [HOP=ss://跳板（所有落地都经过它）] [IN=reality|ss] [PORT=] [NAME=]
+    [[ -n ${LAND:-} ]] || die "需要 LAND=落地的 ss:// 链接（多个落地用空格隔开）"
+    if [[ -n ${HOP:-} ]]; then parse_ss "$HOP" || die "跳板链接无效"; local hh=$P_HOST hpp=$P_PORT hm=$P_METHOD hw=$P_PASS; fi
+    for l in $LAND; do
+      parse_ss "$l" || die "落地链接无效：$l"
+      LN=$((LN + 1)); LH[LN]=$P_HOST; LP[LN]=$P_PORT; LM[LN]=$P_METHOD; LW[LN]=$P_PASS
+      [[ -z $tag ]] && tag=$P_TAG
+      [[ -n ${HOP:-} ]] && { HH[LN]=$hh; HP[LN]=$hpp; HM[LN]=$hm; HW[LN]=$hw; }
+    done
+    NAME=${NAME:-${tag:-线路$ID}}
   else
-    ask_ss "落地" LAND || return
-    local tag=$P_TAG a
+    ask_landing 1 "落地" || return; LN=1; tag=$LTAG
+    while :; do
+      echo
+      read -r -p "再加一个备用落地吗？（多个落地时自动选延迟最低的，挂了自动切换）[y/N]: " a || a=n
+      [[ $a == [yY] ]] || break
+      ask_landing $((LN + 1)) "备用落地 $LN" && LN=$((LN + 1))
+    done
     echo
-    read -r -p "要经过跳板吗？（我 → 本机 → 跳板 → 落地，比如落地只允许某台机器连）[y/N]: " a || a=n
-    [[ $a == [yY] ]] && { ask_ss "跳板" HOP || return; }
-    echo
-    NAME=$(ask "线路名称（显示在客户端里）" "${tag:-落地$ID}")
+    NAME=$(ask "线路名称（显示在客户端里）" "${tag:-线路$ID}")
   fi
   NAME=${NAME//[\"\'\\]/}
   ask_entry
-  mapfile -d '' kv < <(line_kv)
-  save_line "$ID" "${kv[@]}"
+  store_line "$ID"
   open_port "$IN_PORT" both
   if ! apply; then rm -f "$LINES/$ID.env"; apply >/dev/null 2>&1; red "添加失败，已撤销"; return 1; fi
   green "线路 [$ID] $NAME 已添加"
   show_line "$ID"
+  sub_on && yellow "订阅已自动更新，客户端点「更新订阅」就能看到新线路"
   echo; yellow "测试这条线路..."; test_lines "$ID"
 }
-edit_line() {   # 换落地 / 跳板，入口（客户端链接）不变
+edit_line() {   # 改落地 / 跳板，入口（客户端链接）不变
   pick_line || return
-  local ID=$PICKED c; load_line "$ID"
+  local ID=$PICKED c k; load_line "$ID"
   echo "线路：$(route_text)"
-  echo "  1) 换落地"
-  echo "  2) 加上 / 换跳板"
-  echo "  3) 去掉跳板（直连落地）"
+  echo "  1) 换掉某个落地"
+  echo "  2) 加一个备用落地（多个落地自动切换）"
+  echo "  3) 删掉某个落地"
+  echo "  4) 给某个落地加上 / 换跳板"
+  echo "  5) 去掉某个落地的跳板"
+  echo "  6) 改线路名称"
   echo "  0) 返回"
-  read -r -p "请选择 [0-3]: " c || return
+  read -r -p "请选择 [0-6]: " c || return
   case $c in
-    1) ask_ss "新落地" LAND || return ;;
-    2) ask_ss "跳板" HOP || return ;;
-    3) HOP_HOST="" ;;
+    1) pick_land || return; ask_ss "新落地" LAND || return
+       LH[PK]=$LAND_HOST; LP[PK]=$LAND_PORT; LM[PK]=$LAND_METHOD; LW[PK]=$LAND_PASS ;;
+    2) ask_landing $((LN + 1)) "备用落地 $LN" || return; LN=$((LN + 1)) ;;
+    3) (( LN > 1 )) || { red "只有 1 个落地，不能删；要换落地选 1"; return 1; }
+       pick_land || return
+       for ((k = PK; k < LN; k++)); do
+         LH[k]=${LH[k+1]}; LP[k]=${LP[k+1]}; LM[k]=${LM[k+1]}; LW[k]=${LW[k+1]}
+         HH[k]=${HH[k+1]}; HP[k]=${HP[k+1]}; HM[k]=${HM[k+1]}; HW[k]=${HW[k+1]}
+       done
+       LN=$((LN - 1)) ;;
+    4) pick_land || return; ask_ss "跳板" HOP || return
+       HH[PK]=$HOP_HOST; HP[PK]=$HOP_PORT; HM[PK]=$HOP_METHOD; HW[PK]=$HOP_PASS ;;
+    5) pick_land || return; HH[PK]=""; HP[PK]=""; HM[PK]=""; HW[PK]="" ;;
+    6) local n; n=$(ask "新名称" "$NAME"); NAME=${n//[\"\'\\]/} ;;
     *) return ;;
   esac
-  mapfile -d '' kv < <(line_kv)
   local bak; bak=$(cat "$LINES/$ID.env")
-  save_line "$ID" "${kv[@]}"
+  store_line "$ID"
   if ! apply; then printf '%s\n' "$bak" >"$LINES/$ID.env"; apply >/dev/null 2>&1; red "修改失败，已恢复"; return 1; fi
-  load_line "$ID"; green "已修改：$(route_text)（客户端链接不变，不用重新导入）"
-  test_lines "$ID"
+  load_line "$ID"
+  if [[ $c == 6 ]]; then green "已改名为 $NAME（客户端里的名称要重新导入或更新订阅才会变）"
+  else green "已修改（客户端链接不变，不用重新导入）"; echo "线路：$(route_text)"; test_lines "$ID"; fi
 }
 del_line() {   # del_line [ID]
   local ID=$1
@@ -507,12 +622,165 @@ del_line() {   # del_line [ID]
   green "线路 [$ID] $n 已删除"
 }
 
+# ---------------- 订阅（小火箭 / Clash 一次导入全部线路） ----------------
+SUB_ENV=$BASE/sub.env
+WWW=$BASE/www
+SUB_SVC=relay-sub
+sub_on() { [[ -f $SUB_ENV ]]; }
+httpd_cmd() {   # busybox httpd（Debian 在 busybox 里，Alpine 在 busybox-extras 里）
+  if command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -qx httpd; then echo "$(command -v busybox) httpd"
+  elif command -v busybox-extras >/dev/null 2>&1; then echo "$(command -v busybox-extras) httpd"; fi
+}
+sub_svc() {   # sub_svc write|restart|status|remove
+  local port; port=$( . "$SUB_ENV" 2>/dev/null; echo "$PORT")
+  if [[ $INIT == systemd ]]; then
+    case $1 in
+      write) cat >/etc/systemd/system/$SUB_SVC.service <<EOF
+[Unit]
+Description=Relay subscription
+After=network-online.target
+
+[Service]
+ExecStart=$(httpd_cmd) -f -p $port -h $WWW
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+             systemctl daemon-reload; systemctl enable $SUB_SVC >/dev/null 2>&1 ;;
+      restart) systemctl restart $SUB_SVC >/dev/null 2>&1 ;;
+      status) systemctl is-active $SUB_SVC 2>/dev/null ;;
+      remove) systemctl disable --now $SUB_SVC >/dev/null 2>&1; rm -f /etc/systemd/system/$SUB_SVC.service; systemctl daemon-reload ;;
+    esac
+  else
+    local h; h=$(httpd_cmd)
+    case $1 in
+      write) cat >/etc/init.d/$SUB_SVC <<EOF
+#!/sbin/openrc-run
+name="$SUB_SVC"
+command="${h%% *}"
+command_args="${h#* } -f -p $port -h $WWW"
+command_background=true
+pidfile="/run/$SUB_SVC.pid"
+depend() { need net; }
+EOF
+             chmod +x /etc/init.d/$SUB_SVC; rc-update add $SUB_SVC default >/dev/null 2>&1 ;;
+      restart) rc-service $SUB_SVC restart >/dev/null 2>&1 ;;
+      status) rc-service $SUB_SVC status 2>/dev/null | grep -q started && echo active || echo inactive ;;
+      remove) rc-service $SUB_SVC stop >/dev/null 2>&1; rc-update del $SUB_SVC default >/dev/null 2>&1; rm -f /etc/init.d/$SUB_SVC ;;
+    esac
+  fi
+}
+gen_sub() {   # 按全部线路生成订阅文件（每次改线路后自动调用）
+  sub_on || return 0
+  local ID h links="" proxies="" names=()
+  for ID in $(line_ids); do
+    load_line "$ID"
+    for h in $(entry_hosts); do
+      links+="$(client_link "$h")"$'\n'
+      proxies+="$(clash_line "$h")"$'\n'
+      names+=("$NAME$([[ $h == *:* ]] && echo "-v6")")
+    done
+  done
+  ( . "$SUB_ENV"
+    mkdir -p "$WWW/$TOKEN"; rm -f "$WWW/$TOKEN"/*
+    printf '%s' "$links" | base64 | tr -d '\n' >"$WWW/$TOKEN/sub"
+    if [[ ${#names[@]} -gt 0 ]]; then
+      local list; list=$(printf '"%s", ' "${names[@]}"); list=${list%, }
+      cat >"$WWW/$TOKEN/clash.yaml" <<EOF
+# Relay 生成的 Clash Meta / mihomo 配置
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+ipv6: true
+unified-delay: true
+tcp-concurrent: true
+geodata-mode: true
+geox-url:
+  geoip: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.dat"
+  geosite: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.dat"
+  mmdb: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/country.mmdb"
+dns:
+  enable: true
+  ipv6: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  nameserver:
+    - https://223.5.5.5/dns-query
+    - https://1.12.12.12/dns-query
+proxies:
+${proxies%$'\n'}
+proxy-groups:
+  - {name: "节点选择", type: select, proxies: [$list, DIRECT]}
+rules:
+  - GEOIP,LAN,DIRECT,no-resolve
+  - GEOSITE,cn,DIRECT
+  - GEOIP,CN,DIRECT,no-resolve
+  - MATCH,节点选择
+EOF
+    fi
+    chmod -R go-rwx "$WWW" )
+}
+sub_url() {   # sub_url sub|clash.yaml
+  ( . "$SUB_ENV"; local h; h=$(entry_hosts | awk '{print $1}'); [[ $h == *:* ]] && h="[$h]"; echo "http://$h:$PORT/$TOKEN/$1" )
+}
+qr() { [[ $NONINT != 1 ]] && command -v qrencode >/dev/null 2>&1 && qrencode -t ANSIUTF8 "$1"; }
+import_info() {
+  sub_on || return
+  local cu su; cu=$(sub_url clash.yaml); su=$(sub_url sub)
+  blue "【订阅 · Clash Verge / Clash Meta / mihomo】"
+  echo "订阅地址：$cu"
+  echo "一键导入：clash://install-config?url=$(uri "$cu")&name=relay"
+  qr "$cu"
+  blue "【订阅 · 小火箭 Shadowrocket / v2rayN】"
+  echo "订阅地址：$su"
+  qr "sub://$(printf '%s' "$su" | base64 | tr -d '\n')#relay"
+  yellow "订阅地址等于全部线路的密码，不要公开；泄露后在订阅菜单里更换地址"
+}
+sub_enable() {
+  if ! sub_on; then
+    if [[ -z $(httpd_cmd) ]]; then
+      case $PKG in apt) DEBIAN_FRONTEND=noninteractive apt-get install -y -qq busybox >/dev/null ;; apk) apk add --no-cache busybox-extras >/dev/null ;; dnf|yum) $PKG install -y -q busybox >/dev/null ;; esac
+    fi
+    [[ -n $(httpd_cmd) ]] || { red "安装 busybox httpd 失败"; return 1; }
+    printf "PORT='%s'\nTOKEN='%s'\n" "$(rand_port)" "$(openssl rand -hex 16)" >"$SUB_ENV"; chmod 600 "$SUB_ENV"
+    mkdir -p "$WWW"
+    open_port "$( . "$SUB_ENV"; echo "$PORT")" tcp
+    sub_svc write
+  fi
+  gen_sub; sub_svc restart; sleep 1
+  [[ $(sub_svc status) == active ]] || { red "订阅服务启动失败"; return 1; }
+  green "订阅已开启（加线路 / 改线路后自动更新，客户端点「更新订阅」即可）"
+  import_info
+}
+sub_reset() {
+  sub_on || { yellow "订阅未开启"; return; }
+  ( . "$SUB_ENV"; rm -rf "${WWW:?}/$TOKEN"; printf "PORT='%s'\nTOKEN='%s'\n" "$PORT" "$(openssl rand -hex 16)" >"$SUB_ENV" )
+  gen_sub; green "已更换订阅地址，旧地址立即失效："; import_info
+}
+sub_disable() {
+  sub_on || { yellow "订阅未开启"; return; }
+  sub_svc remove; rm -rf "$WWW" "$SUB_ENV"; green "订阅已关闭"
+}
+sub_menu() {
+  echo
+  echo "订阅链接（小火箭 / Clash 一次导入全部线路）：$(sub_on && echo 已开启 || echo 未开启)"
+  echo "  1) 开启 / 查看订阅地址和二维码"
+  echo "  2) 更换订阅地址（旧地址失效）"
+  echo "  3) 关闭订阅"
+  echo "  0) 返回"
+  local c; read -r -p "请选择 [0-3]: " c || return
+  case $c in 1) sub_enable ;; 2) sub_reset ;; 3) sub_disable ;; esac
+}
+
 # ---------------- 其它 ----------------
 status() {
   echo
   if [[ -f $CONF ]]; then
     [[ $(svc status) == active ]] && green "$SVC：运行中" || red "$SVC：未运行"
   else yellow "还没有线路"; fi
+  sub_on && { [[ $(sub_svc status) == active ]] && green "$SUB_SVC（订阅）：运行中" || red "$SUB_SVC（订阅）：未运行"; }
   [[ -x $BIN ]] && echo "Xray：$(xray_cur)$([[ $XRAY_VER == compat ]] && echo "（兼容版，REALITY 对 Xray / sing-box / mihomo 客户端都能连）")"
   echo "线路："; brief
   echo
@@ -536,7 +804,14 @@ self_update() {
   fi
   nv=$(grep -m1 '^RELAY_VER=' "$tmp" | cut -d'"' -f2)
   if [[ $nv == "$RELAY_VER" && $1 != force ]]; then rm -f "$tmp"; green "已经是最新版 v$RELAY_VER"; return 0; fi
-  install -m 755 "$tmp" "$CMD"; rm -f "$tmp"; green "脚本已更新：v$RELAY_VER → v$nv（线路不变）"
+  install -m 755 "$tmp" "$CMD"; rm -f "$tmp"
+  "$CMD" migrate
+  green "脚本已更新：v$RELAY_VER → v$nv（线路和客户端链接不变）"
+}
+migrate() {   # 新版第一次运行：把旧格式线路存成新格式、重新生成配置
+  local ID; for ID in $(line_ids); do load_line "$ID"; store_line "$ID"; done
+  [[ -n $(line_ids) ]] && apply >/dev/null 2>&1
+  return 0
 }
 update_menu() {
   echo
@@ -557,7 +832,8 @@ uninstall_all() {
   if [[ $NONINT != 1 ]]; then
     local a; read -r -p "确定删除全部中转线路并卸载？[Y/n]: " a || return; [[ $a == [nN] ]] && return
   fi
-  svc_remove; rm -rf "$BASE" "$BIN" "$CMD" /etc/sysctl.d/99-relay-bbr.conf
+  svc_remove; sub_on && sub_svc remove
+  rm -rf "$BASE" "$BIN" "$CMD" /etc/sysctl.d/99-relay-bbr.conf
   green "中转脚本已全部卸载（本机的 onekey / 3x-ui 不受影响）"
 }
 
@@ -565,29 +841,31 @@ main_menu() {
   while :; do
     echo
     blue "=========== Relay 中转一键脚本 v$RELAY_VER ==========="
-    local n; n=$(line_ids | wc -l); echo "  当前 $n 条线路"
-    echo "  1) 添加线路（粘贴落地 ss:// 链接或手动填写，可加跳板）"
+    local n; n=$(line_ids | wc -l); echo "  当前 $n 条线路$(sub_on && echo "，订阅已开启")"
+    echo "  1) 添加线路（粘贴落地 ss:// 链接或手动填写，可加跳板 / 备用落地）"
     echo "  2) 查看线路（客户端链接 / 二维码 / Clash）"
-    echo "  3) 测试线路（出口是不是落地 IP）"
-    echo "  4) 修改线路（换落地 / 跳板，客户端链接不变）"
+    echo "  3) 测试线路（整条线路 + 每个落地单独测）"
+    echo "  4) 修改线路（换落地 / 加备用落地 / 跳板，客户端链接不变）"
     echo "  5) 删除线路"
-    echo "  6) 运行状态"
-    echo "  7) 开启 BBR"
-    echo "  8) 更新（脚本 / Xray 版本）"
-    echo "  9) 卸载"
+    echo "  6) 订阅链接（小火箭 / Clash 一次导入全部线路）"
+    echo "  7) 运行状态"
+    echo "  8) 开启 BBR"
+    echo "  9) 更新（脚本 / Xray 版本）"
+    echo " 10) 卸载"
     echo "  0) 退出"
     echo
-    local c; read -r -p "请选择 [0-9]: " c || { echo; exit 0; }
+    local c; read -r -p "请选择 [0-10]: " c || { echo; exit 0; }
     case $c in
       1) add_line ;;
       2) list_lines ;;
       3) test_lines ;;
       4) edit_line ;;
       5) del_line ;;
-      6) status ;;
-      7) enable_bbr ;;
-      8) update_menu ;;
-      9) uninstall_all; exit 0 ;;
+      6) sub_menu ;;
+      7) status ;;
+      8) enable_bbr ;;
+      9) update_menu ;;
+      10) uninstall_all; exit 0 ;;
       0) exit 0 ;;
     esac
   done
@@ -596,10 +874,15 @@ main_menu() {
 usage() {
   cat <<EOF
 用法：relay                  打开菜单
-      relay add              非交互添加：LAND='ss://落地' [HOP='ss://跳板'] [IN=reality|ss] [PORT=] [NAME=] [SNI=]
+      relay add              非交互添加（参数用环境变量）：
+                               LAND='ss://落地'                   一个落地
+                               LAND='ss://落地1 ss://落地2'        多个落地，自动选最快的可用落地
+                               HOP='ss://跳板'                    经跳板（所有落地都经过它）
+                               IN=reality|ss  PORT=  NAME=  SNI_SET=  IN_METHOD_SET=
       relay list             查看全部线路
-      relay test [编号]      测试线路
+      relay test [编号]      测试线路（整条 + 每个落地单独测）
       relay del <编号>       删除线路
+      relay sub [on|reset|off]  订阅：开启·查看 / 换地址 / 关闭
       relay status           运行状态
       relay xray [compat|latest|v26.6.27]  查看 / 切换 Xray 版本
       relay update           更新脚本
@@ -615,9 +898,11 @@ case $1 in
   list) NONINT=1 list_lines ;;
   test) shift; test_lines "$@" ;;
   del|remove) del_line "$2" ;;
+  sub) case $2 in reset) sub_reset ;; off) sub_disable ;; *) NONINT=1 sub_enable ;; esac ;;
   status) status ;;
   xray) if [[ -n $2 ]]; then set_xray_ver "$2"; else echo "Xray：$( [[ -x $BIN ]] && xray_cur || echo 未安装)（设置：$XRAY_VER）"; fi ;;
   update) self_update "$2" ;;
+  migrate) migrate ;;
   uninstall) NONINT=1 uninstall_all ;;
   -v|--version) echo "$RELAY_VER" ;;
   *) usage ;;
