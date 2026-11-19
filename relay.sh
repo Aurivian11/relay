@@ -11,7 +11,7 @@
 # =============================================================
 set -o pipefail
 
-RELAY_VER="1.1.0"
+RELAY_VER="1.1.1"
 SCRIPT_URL="${RELAY_URL:-https://raw.githubusercontent.com/Aurivian11/relay/main/relay.sh}"
 
 BASE=/etc/relay
@@ -158,6 +158,7 @@ svc_remove() {
 # ---------------- Xray（独立一份，默认兼容版） ----------------
 CORE_ENV=$BASE/core.env
 XRAY_VER=${XRAY_VER:-}
+XRAY_VER_SET=$XRAY_VER          # 命令行用 XRAY_VER= 指定过版本，就不再询问
 [[ -z $XRAY_VER && -f $CORE_ENV ]] && . "$CORE_ENV"
 XRAY_VER=${XRAY_VER:-compat}
 save_core_env() { mkdir -p "$BASE"; printf "XRAY_VER='%s'\n" "$XRAY_VER" >"$CORE_ENV"; }
@@ -195,6 +196,25 @@ set_xray_ver() {   # compat | latest | vX.Y.Z
     fi
   fi
   green "Xray 已换成 $(xray_cur)$([[ $XRAY_VER == compat ]] && echo "（兼容版）")"
+}
+xray_ver_ask() {   # 菜单里第一次加线路（本机还没装 Xray）时选版本；一键命令不问，用兼容版或 XRAY_VER=
+  [[ -x $BIN || -n $XRAY_VER_SET || $NONINT == 1 ]] && return 0
+  local c v
+  echo
+  echo "选择 Xray 内核版本（以后可在主菜单 9「更新」里修改）："
+  echo "  1) 兼容版 $XRAY_COMPAT   REALITY 对 Xray / sing-box / mihomo（Clash Meta）内核的客户端都能连（推荐）"
+  echo "  2) 最新版              REALITY 只有 Xray 内核客户端（如 v2rayN）能连，sing-box / mihomo 内核连不上"
+  echo "  3) 指定版本号"
+  echo "  （只影响 VLESS-REALITY 入口；SS 入口两个版本都一样）"
+  c=$(ask "请选择" 1)
+  case $c in
+    2) XRAY_VER=latest ;;
+    3) v=$(ask "版本号（如 v26.6.27，见 github.com/XTLS/Xray-core/releases）" "$XRAY_COMPAT")
+       [[ $v == v* ]] || v=v$v
+       if [[ $v =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then XRAY_VER=$v; else red "版本号格式不对，改用兼容版"; XRAY_VER=compat; fi
+       [[ $XRAY_VER == "$XRAY_COMPAT" ]] && XRAY_VER=compat ;;
+    *) XRAY_VER=compat ;;
+  esac
 }
 
 # ---------------- SS 链接解析 ----------------
@@ -570,6 +590,7 @@ add_line() {
   fi
   NAME=${NAME//[\"\'\\]/}
   ask_entry
+  xray_ver_ask
   store_line "$ID"
   open_port "$IN_PORT" both
   if ! apply; then rm -f "$LINES/$ID.env"; apply >/dev/null 2>&1; red "添加失败，已撤销"; return 1; fi

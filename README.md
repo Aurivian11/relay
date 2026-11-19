@@ -29,7 +29,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/Aurivian11/relay/main/relay.sh
 以后输入 `relay` 打开菜单：
 
 ```
-=========== Relay 中转一键脚本 v1.1.0 ===========
+=========== Relay 中转一键脚本 v1.1.1 ===========
   1) 添加线路（粘贴落地 ss:// 链接或手动填写，可加跳板 / 备用落地）
   2) 查看线路（客户端链接 / 二维码 / Clash）
   3) 测试线路（整条线路 + 每个落地单独测）
@@ -135,6 +135,21 @@ relay uninstall             # 卸载
 | `/usr/local/bin/relay` | 菜单命令 |
 | `/usr/local/bin/xray-relay` | 本脚本自带的 Xray |
 | `relay-xray` / `relay-sub` | 系统服务 |
+
+## Xray 版本
+
+relay 用自己单独的一份 Xray（`/usr/local/bin/xray-relay`），版本可以自己选：
+
+| 选项 | 版本 | VLESS-REALITY 入口能连的客户端 |
+|---|---|---|
+| **兼容版（默认）** | 固定 v26.6.27 | Xray / sing-box / mihomo（Clash Meta）内核都能连 |
+| 最新版 | 跟随 Xray 最新正式版 | 只有 Xray 内核客户端（如 v2rayN）；sing-box / mihomo 内核连不上 |
+| 指定版本号 | 自己填，如 v26.3.27 | — |
+
+- **菜单里第一次加线路**（本机还没装 relay 的 Xray）时会问选哪个，回车 = 兼容版。
+- **一键命令**（`relay add`）全自动不提问，默认兼容版；要别的版本在前面加 `XRAY_VER=`：
+  `XRAY_VER=latest LAND='ss://...' relay add`
+- **以后换版本**：菜单 9（更新）里的 2 / 3 / 4，或 `relay xray compat|latest|v26.x.y`。换版本时先下载确认能运行才替换，失败自动换回，线路和客户端链接不变。
 
 ## 已知情况
 
